@@ -1,0 +1,85 @@
+name: Build and Distribute APK
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Notify Backend - Start Generation
+        run: |
+          curl -X GET "https://app-distributer-backend.onrender.com/api/apps/generate/com.example.app_distributer" || true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release --build-number=${{ github.run_number }}
+
+      - name: Install AWS CLI (for R2 upload)
+        run: |
+          pip install awscli --upgrade --quiet
+
+      - name: Upload APK to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION_CODE=${{ github.run_number }}
+          aws s3 cp build/app/outputs/flutter-apk/app-release.apk \
+            s3://${{ secrets.R2_BUCKET_NAME }}/app-release-v$VERSION_CODE.apk \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com \
+            --no-progress
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Release v${{ github.run_number }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Backend - Build Failed
+        if: failure()
+        run: |
+          curl -X GET "https://app-distributer-backend.onrender.com/api/apps/generate-fail/com.example.app_distributer" || true
+
+      - name: Notify Backend - Build Success
+        if: success()
+        run: |
+          APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          SIZE_IN_BYTES=$(stat -c%s "$APK_PATH")
+          VERSION_CODE=${{ github.run_number }}
+
+          # ✅ Fully public URL - no login needed
+          APK_URL="${{ secrets.R2_PUBLIC_URL }}/app-release-v$VERSION_CODE.apk"
+
+          curl -X POST "https://app-distributer-backend.onrender.com/api/apps" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"id\": \"1\",
+            \"name\": \"My App\",
+            \"package\": \"com.example.chat_app\",
+            \"version\": \"1.0.0\",
+            \"version_code\": $VERSION_CODE,
+            \"apk_url\": \"$APK_URL\",
+            \"changelog\": \"Bug fixes and improvements\",
+            \"size\": $SIZE_IN_BYTES
+          }"
